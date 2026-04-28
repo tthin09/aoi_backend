@@ -1,3 +1,4 @@
+import base64
 from datetime import datetime
 from typing import List, Optional
 
@@ -72,9 +73,8 @@ class AOIRecord(BaseModel):
     defect: Optional[str]
     bo_type: Optional[str]
     inspection_time: Optional[datetime]
-    x: Optional[float]
-    y: Optional[float]
-    rotation: Optional[float]
+    position: Optional[dict] = None
+    image_2d: Optional[str] = None
 
 
 class FailedResponse(BaseModel):
@@ -188,7 +188,8 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
             PCBGUID,
             JobFileIDShare,
             BarCode,
-            ResultDBName
+            ResultDBName,
+            ImageDBName
         FROM TB_AOIPCB
         WHERE BarCode = ?
         ORDER BY StartDateTime DESC
@@ -212,6 +213,7 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
                 "bo_type": bo_type,
                 "barcode": row.BarCode,
                 "result_db": row.ResultDBName,
+                "image_db": row.ImageDBName,
             }
         )
 
@@ -220,6 +222,7 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
 
     bo_map = {pcb["pcbguid"]: pcb["bo_type"] for pcb in pcbs}
     bar_map = {pcb["pcbguid"]: pcb["barcode"] for pcb in pcbs}
+    img_map = {pcb["pcbguid"]: pcb.get("image_db") for pcb in pcbs}
 
     pcbs_by_db: dict[str, list[str]] = {}
     for pcb in pcbs:
@@ -229,6 +232,21 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
     fail_codes_str = ",".join(str(code) for code in TARGET_DEFECTS.values())
     now = datetime.utcnow()
     results: list[dict] = []
+    image_conns: dict[str, pyodbc.Connection] = {}
+    image_cursors: dict[str, pyodbc.Cursor] = {}
+
+    def get_image_cursor(image_db: str) -> Optional[pyodbc.Cursor]:
+        if not image_db:
+            return None
+        if image_db in image_cursors:
+            return image_cursors[image_db]
+        try:
+            conn = _get_sqlserver_conn(image_db)
+            image_conns[image_db] = conn
+            image_cursors[image_db] = conn.cursor()
+            return image_cursors[image_db]
+        except Exception:
+            return None
 
     for db_result, pcbguids in pcbs_by_db.items():
         if not pcbguids:
@@ -239,6 +257,7 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
         cursor.execute(
             f"""
             SELECT
+                c.ComponentGUID,
                 c.PCBGUID,
                 c.uname,
                 c.PackageType,
@@ -253,6 +272,23 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
         )
         for row in cursor.fetchall():
             pcbguid = str(row.PCBGUID)
+            image_2d = None
+            image_db = img_map.get(pcbguid)
+            image_cursor = get_image_cursor(image_db)
+            if image_cursor is not None:
+                try:
+                    image_cursor.execute(
+                        """
+                        SELECT TOP 1 Image2D FROM TB_Image2D
+                        WHERE ComponentGUID = ? AND Image2D IS NOT NULL
+                        """,
+                        (row.ComponentGUID,),
+                    )
+                    image_row = image_cursor.fetchone()
+                    if image_row and image_row[0]:
+                        image_2d = bytes(image_row[0])
+                except Exception:
+                    image_2d = None
             results.append(
                 {
                     "pkg_type": row.PackageType,
@@ -262,9 +298,21 @@ def _fetch_failed_from_sqlserver(barcode: str) -> tuple[list[dict], bool]:
                     "bo_type": bo_map.get(pcbguid),
                     "inspection_time": now,
                     "barcode": bar_map.get(pcbguid, barcode),
+                    "image_2d": image_2d,
                 }
             )
         conn.close()
+
+    for cursor in image_cursors.values():
+        try:
+            cursor.close()
+        except Exception:
+            pass
+    for conn in image_conns.values():
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return results, True
 
@@ -276,8 +324,8 @@ def _save_failed_rows_to_postgres(rows: list[dict]) -> None:
         conn_info = _build_conn_info()
         insert_query = (
             "INSERT INTO aoi_metadata_1 "
-            "(pkg_type, uname, label, defect, bo_type, inspection_time, barcode) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            "(pkg_type, uname, label, defect, bo_type, inspection_time, barcode, image_2d) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
         )
         values = [
             (
@@ -288,6 +336,7 @@ def _save_failed_rows_to_postgres(rows: list[dict]) -> None:
                 row.get("bo_type"),
                 row.get("inspection_time"),
                 row.get("barcode"),
+                _coerce_image_bytes(row.get("image_2d")),
             )
             for row in rows
         ]
@@ -298,6 +347,21 @@ def _save_failed_rows_to_postgres(rows: list[dict]) -> None:
                 cur.executemany(insert_query, values)
     except Exception as exc:
         print(f"Failed to save fallback rows: {exc}")
+
+
+def _coerce_image_bytes(value: Optional[object]) -> Optional[bytes]:
+    if value is None:
+        return None
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        try:
+            return base64.b64decode(value)
+        except Exception:
+            return None
+    return None
 
 
 def _resolve_part_position_csv(board_type: str) -> Optional[str]:
@@ -353,9 +417,14 @@ def _attach_positions(rows: list[dict]) -> list[dict]:
     for row in rows:
         board_type = row.get("bo_type")
         uname = row.get("uname")
-        row["x"] = None
-        row["y"] = None
-        row["rotation"] = None
+        row.setdefault("image_2d", None)
+        row["position"] = None
+        if "image_2d" in row:
+            image_value = row["image_2d"]
+            if isinstance(image_value, memoryview):
+                image_value = image_value.tobytes()
+            if isinstance(image_value, (bytes, bytearray)):
+                row["image_2d"] = base64.b64encode(image_value).decode("ascii")
         if not board_type or not uname:
             continue
 
@@ -371,11 +440,30 @@ def _attach_positions(rows: list[dict]) -> list[dict]:
         pos = positions[0] if isinstance(positions, list) else positions
         if not isinstance(pos, dict):
             continue
-        row["x"] = pos.get("x")
-        row["y"] = pos.get("y")
-        row["rotation"] = pos.get("rotation")
+        row["position"] = {
+            "x": pos.get("x"),
+            "y": pos.get("y"),
+            "rotation": pos.get("rotation"),
+        }
 
     return rows
+
+
+def _dedupe_rows(rows: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = (
+            row.get("pkg_type"),
+            row.get("uname"),
+            row.get("bo_type"),
+            row.get("inspection_time"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
 def _resolve_image_path(board_type: str) -> Optional[str]:
@@ -422,7 +510,7 @@ def get_failed_by_barcode(
         barcode_exists = False
         conn_info = _build_conn_info()
         fail_query = (  
-            "SELECT pkg_type, uname, label, defect, bo_type, inspection_time "
+            "SELECT pkg_type, uname, label, defect, bo_type, inspection_time, image_2d "
             "FROM aoi_metadata_1 "
             "WHERE barcode = %s AND lower(label) = 'fail'"
         )
@@ -432,7 +520,7 @@ def get_failed_by_barcode(
                 rows = cur.fetchall()
                 if rows:
                     return {
-                        "items": _attach_positions(rows),
+                        "items": _attach_positions(_dedupe_rows(rows)),
                         "message": "Found on PostgreSQL",
                     }
 
@@ -469,15 +557,13 @@ def get_failed_by_barcode(
                     "defect",
                     "bo_type",
                     "inspection_time",
-                    "x",
-                    "y",
-                    "rotation",
+                    "image_2d",
                 }
             }
             for row in sql_rows
         ]
         return {
-            "items": _attach_positions(response_rows),
+            "items": _attach_positions(_dedupe_rows(response_rows)),
             "message": "Found on SQL Server",
         }
     except HTTPException:
