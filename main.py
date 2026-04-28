@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional
 
 import json
@@ -14,9 +15,12 @@ load_dotenv()
 
 app = FastAPI(title="AOI Backend")
 
+DB_CONNECT_TIMEOUT_SECONDS = 5
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 IMAGE_DIR = os.path.join(DATA_DIR, "image")
+IMAGE_ALIAS_PATH = os.path.join(IMAGE_DIR, "alias.json")
 PART_POSITION_DIR = os.path.join(DATA_DIR, "part_position")
 ALIAS_PATH = os.path.join(PART_POSITION_DIR, "alias.json")
 
@@ -26,6 +30,8 @@ class AOIRecord(BaseModel):
     uname: Optional[str]
     label: Optional[str]
     defect: Optional[str]
+    bo_type: Optional[str]
+    inspection_time: Optional[datetime]
 
 
 def _build_conn_info() -> str:
@@ -46,26 +52,55 @@ def _build_conn_info() -> str:
 
 
 def _resolve_part_position_csv(board_type: str) -> Optional[str]:
-    direct_path = os.path.join(PART_POSITION_DIR, f"{board_type}.csv")
-    if os.path.isfile(direct_path):
-        return direct_path
+    if os.path.isfile(ALIAS_PATH):
+        with open(ALIAS_PATH, "r", encoding="utf-8") as handle:
+            alias_map = json.load(handle)
+        candidates = alias_map.get(board_type, [board_type])
+    else:
+        candidates = [board_type]
 
-    if not os.path.isfile(ALIAS_PATH):
-        return None
-
-    with open(ALIAS_PATH, "r", encoding="utf-8") as handle:
-        aliases = json.load(handle)
-
-    for entry in aliases:
-        if entry.get("board_type") != board_type:
-            continue
-        for candidate in entry.get("part_position", []):
-            name = candidate if candidate.lower().endswith(".csv") else f"{candidate}.csv"
-            alias_path = os.path.join(PART_POSITION_DIR, name)
-            if os.path.isfile(alias_path):
-                return alias_path
+    for candidate in candidates:
+        name = candidate if candidate.lower().endswith(".csv") else f"{candidate}.csv"
+        csv_path = os.path.join(PART_POSITION_DIR, name)
+        if os.path.isfile(csv_path):
+            return csv_path
 
     return None
+
+
+def _resolve_image_path(board_type: str) -> Optional[str]:
+    if os.path.isfile(IMAGE_ALIAS_PATH):
+        with open(IMAGE_ALIAS_PATH, "r", encoding="utf-8") as handle:
+            alias_map = json.load(handle)
+        candidates = alias_map.get(board_type, [board_type])
+    else:
+        candidates = [board_type]
+
+    newest_path = None
+    newest_mtime = None
+    for candidate in candidates:
+        name = candidate if candidate.lower().endswith(".jpg") else f"{candidate}.jpg"
+        image_path = os.path.join(IMAGE_DIR, name)
+        if not os.path.isfile(image_path):
+            continue
+        mtime = os.path.getmtime(image_path)
+        if newest_mtime is None or mtime > newest_mtime:
+            newest_mtime = mtime
+            newest_path = image_path
+
+    return newest_path
+
+
+def _get_bo_type_by_barcode(barcode: str) -> str:
+    conn_info = _build_conn_info()
+    query = "SELECT bo_type FROM aoi_metadata WHERE barcode = %s LIMIT 1"
+    with psycopg.connect(conn_info, connect_timeout=DB_CONNECT_TIMEOUT_SECONDS) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, (barcode,))
+            row = cur.fetchone()
+    if row is None or not row.get("bo_type"):
+        raise HTTPException(status_code=404, detail=f"Barcode not found: {barcode}")
+    return row["bo_type"]
 
 
 @app.get("/aoi/failed", response_model=List[AOIRecord])
@@ -74,12 +109,12 @@ def get_failed_by_barcode(
 ) -> List[AOIRecord]:
     try:
         conn_info = _build_conn_info()
-        fail_query = (
-            "SELECT pkg_type, uname, label, defect "
+        fail_query = (  
+            "SELECT pkg_type, uname, label, defect, bo_type, inspection_time "
             "FROM aoi_metadata "
             "WHERE barcode = %s AND lower(label) = 'fail'"
         )
-        with psycopg.connect(conn_info) as conn:
+        with psycopg.connect(conn_info, connect_timeout=DB_CONNECT_TIMEOUT_SECONDS) as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(fail_query, (barcode,))
                 rows = cur.fetchall()
@@ -105,18 +140,20 @@ def get_failed_by_barcode(
 
 @app.get("/aoi/image")
 def get_board_image(
-    board_type: str = Query(..., min_length=1, description="Board type"),
+    barcode: str = Query(..., min_length=1, description="Barcode"),
 ) -> FileResponse:
-    image_path = os.path.join(IMAGE_DIR, f"{board_type}.jpg")
-    if not os.path.isfile(image_path):
+    board_type = _get_bo_type_by_barcode(barcode)
+    image_path = _resolve_image_path(board_type)
+    if image_path is None:
         raise HTTPException(status_code=404, detail=f"Image not found: {board_type}")
     return FileResponse(image_path, media_type="image/jpeg")
 
 
 @app.get("/aoi/part-position")
 def get_part_position(
-    board_type: str = Query(..., min_length=1, description="Board type"),
+    barcode: str = Query(..., min_length=1, description="Barcode"),
 ) -> FileResponse:
+    board_type = _get_bo_type_by_barcode(barcode)
     csv_path = _resolve_part_position_csv(board_type)
     if csv_path is None:
         raise HTTPException(
