@@ -82,6 +82,12 @@ class FailedResponse(BaseModel):
     message: Optional[str] = None
 
 
+class FailedBoard(BaseModel):
+    barcode: str
+    bo_type: Optional[str]
+    inspection_time: Optional[datetime]
+
+
 def _build_conn_info() -> str:
     missing = [
         name
@@ -146,6 +152,96 @@ def _parse_bo_type(job_file_id_share: str) -> str:
         return bo + side
 
     return "UNKNOWN"
+
+
+def _get_recent_failed_barcodes(limit: int = 10) -> list[FailedBoard]:
+    conn_main = _get_sqlserver_conn(SQLSERVER_DB_MAIN)
+    cursor = conn_main.cursor()
+    cursor.execute(
+        """
+        SELECT TOP 200
+            PCBGUID,
+            JobFileIDShare,
+            BarCode,
+            ResultDBName,
+            StartDateTime
+        FROM TB_AOIPCB
+        ORDER BY StartDateTime DESC
+        """
+    )
+    pcb_rows = cursor.fetchall()
+    conn_main.close()
+
+    if not pcb_rows:
+        return []
+
+    recent_pcbs = []
+    for row in pcb_rows:
+        bo_type = _parse_bo_type(row.JobFileIDShare)
+        if bo_type not in VALID_BO_TYPES:
+            continue
+        recent_pcbs.append(
+            {
+                "pcbguid": str(row.PCBGUID),
+                "barcode": row.BarCode,
+                "bo_type": bo_type,
+                "result_db": row.ResultDBName,
+                "inspection_time": row.StartDateTime,
+            }
+        )
+
+    if not recent_pcbs:
+        return []
+
+    pcbs_by_db: dict[str, list[str]] = {}
+    for pcb in recent_pcbs:
+        pcbs_by_db.setdefault(pcb["result_db"], []).append(pcb["pcbguid"])
+
+    pass_codes_str = ",".join(str(code) for code in PASS_CODES)
+    fail_codes_str = ",".join(str(code) for code in TARGET_DEFECTS.values())
+    fail_pcbs: set[str] = set()
+
+    for db_result, pcbguids in pcbs_by_db.items():
+        if not pcbguids:
+            continue
+        guid_list = "','".join(guid.replace("'", "''") for guid in pcbguids)
+        conn = _get_sqlserver_conn(db_result)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT DISTINCT c.PCBGUID
+            FROM TB_AOIDefect c
+            JOIN TB_AOIDefectDetail d
+              ON d.ComponentGUID = c.ComponentGUID
+            WHERE c.PCBGUID IN ('{guid_list}')
+            AND c.ResultAfter NOT IN ({pass_codes_str})
+            AND d.Defect IN ({fail_codes_str})
+            """
+        )
+        for row in cursor.fetchall():
+            fail_pcbs.add(str(row.PCBGUID))
+        conn.close()
+
+    results: list[FailedBoard] = []
+    seen_barcodes: set[str] = set()
+    for pcb in recent_pcbs:
+        if pcb["pcbguid"] not in fail_pcbs:
+            continue
+        barcode = pcb["barcode"]
+        if not barcode or barcode in seen_barcodes:
+            continue
+        seen_barcodes.add(barcode)
+        results.append(
+            FailedBoard(
+                barcode=barcode,
+                bo_type=pcb["bo_type"],
+                inspection_time=pcb["inspection_time"],
+            )
+        )
+        if len(results) >= limit:
+            break
+
+    return results
 
 
 def _get_sqlserver_conn(db_name: str) -> pyodbc.Connection:
@@ -572,6 +668,16 @@ def get_failed_by_barcode(
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/aoi/failed/recent", response_model=List[FailedBoard])
+def get_recent_failed_barcodes(
+    limit: int = Query(10, ge=1, le=50, description="Number of barcodes to return"),
+) -> List[FailedBoard]:
+    try:
+        return _get_recent_failed_barcodes(limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"SQL Server error: {exc}")
 
 
 @app.get("/aoi/image")
