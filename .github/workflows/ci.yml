@@ -55,5 +55,5 @@ jobs:
       - name: Deploy to self-hosted runner
         if: success()
         run: |
-          chmod +x ./backend/deploy.sh
-          ./backend/deploy.sh
+          chmod +x ./deploy.sh
+          ./deploy.sh
