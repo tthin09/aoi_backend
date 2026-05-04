@@ -1,9 +1,39 @@
 import os
+import sys
 import json
 import pytest
+import importlib
 from fastapi.testclient import TestClient
 
-from main import app
+# Try several import paths for the application module so tests work whether
+# the repository root layout is "repo root" or a nested `backend/` folder.
+app = None
+candidates = ["main", "backend.main", "aoi_backend.main"]
+for cand in candidates:
+    try:
+        mod = importlib.import_module(cand)
+        app = getattr(mod, "app", None)
+        if app is not None:
+            break
+    except Exception:
+        continue
+
+if app is None:
+    # As a last resort, add repository parent to sys.path and try again
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    for cand in candidates:
+        try:
+            mod = importlib.import_module(cand)
+            app = getattr(mod, "app", None)
+            if app is not None:
+                break
+        except Exception:
+            continue
+
+if app is None:
+    pytest.exit("Could not import FastAPI `app` from main module. Check project layout.")
 
 client = TestClient(app)
 
