@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  aoi_backend:
+    build: .
+    container_name: aoi_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    # If you use a local DB socket or other services, add them here
