@@ -5,7 +5,7 @@ set -euo pipefail
 # - Assumes repository is already checked out by the runner
 # - Uses docker compose in backend/ to build and run the service
 
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$HOME/Code/aoi-backend"
 cd "$ROOT_DIR"
 
 echo "[deploy] Running in $ROOT_DIR"
