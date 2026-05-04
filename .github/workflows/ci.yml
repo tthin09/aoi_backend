@@ -50,3 +50,9 @@ jobs:
           TEST_BARCODE_FAILED: ${{ secrets.TEST_BARCODE_FAILED }}
         run: |
           pytest -q
+
+      - name: Deploy to self-hosted runner
+        if: success()
+        run: |
+          chmod +x ./backend/deploy.sh
+          ./backend/deploy.sh
