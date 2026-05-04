@@ -609,7 +609,7 @@ pass_dist = (
     .reset_index(name="count")
 )
 for _, r in pass_dist.iterrows():
-    bar = "█" * (r["count"] // 200)
+    bar = "█" * (r["count"] // 500)
     print(f"  {r['bo_type']:<30} {r['pkg_type']:<22}: {r['count']:6,} {bar}")
 
 print("\nPhân bổ theo bo_type:")

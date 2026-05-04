@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          # Optional secrets to run integration tests. Set these in repository Secrets if needed.
+          HOST_NAME: ${{ secrets.HOST_NAME }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          USER: ${{ secrets.USER }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          PORT: ${{ secrets.PORT }}
+          SQLSERVER_HOST: ${{ secrets.SQLSERVER_HOST }}
+          SQLSERVER_PORT: ${{ secrets.SQLSERVER_PORT }}
+          SQLSERVER_USER: ${{ secrets.SQLSERVER_USER }}
+          SQLSERVER_PASSWORD: ${{ secrets.SQLSERVER_PASSWORD }}
+          SQLSERVER_DB_MAIN: ${{ secrets.SQLSERVER_DB_MAIN }}
+          TEST_BARCODE_IMAGE: ${{ secrets.TEST_BARCODE_IMAGE }}
+          TEST_BARCODE_PART_POSITION: ${{ secrets.TEST_BARCODE_PART_POSITION }}
+          TEST_BARCODE_FAILED: ${{ secrets.TEST_BARCODE_FAILED }}
+        run: |
+          pytest -q

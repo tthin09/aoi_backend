@@ -3,3 +3,5 @@ uvicorn
 psycopg[binary]
 python-dotenv
 pyodbc
+pytest
+httpx
