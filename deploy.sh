@@ -16,6 +16,10 @@ else
   COMPOSE_CMD="docker compose"
 fi
 
+cp ~/Code/aoi-backend/.env ./.env
+
+echo "[env] Copied .env into $ROOT_DIR"
+
 echo "[deploy] Using compose command: $COMPOSE_CMD"
 
 echo "[deploy] Pulling images (if any)..."
